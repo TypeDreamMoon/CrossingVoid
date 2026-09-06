@@ -1,0 +1,20 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0.0",
+  "FriendlyName": "ZD Bridge",
+  "Description": "Editor bridge for CrossingVoid Paper2D and PaperZD automation.",
+  "Category": "Editor Scripting",
+  "CanContainContent": false,
+  "Modules": [
+    {
+      "Name": "ZDBridge",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    { "Name": "Paper2D", "Enabled": true },
+    { "Name": "PaperZD", "Enabled": true }
+  ]
+}
