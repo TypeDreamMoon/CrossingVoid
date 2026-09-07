@@ -61,4 +61,19 @@ public:
     // deleted, assetClass, hardReferencers, softReferencers, action, error } ] }
     UFUNCTION(BlueprintCallable, Category = "ZDBridge|Assets", CallInEditor)
     static FString PurgeAssets(const TArray<FString>& ObjectPaths);
+
+    // Unbinds sequences from their PaperZD AnimationSource without touching the assets.
+    //
+    // PaperZD 2.2 keeps no SupportedAnimations array on the source: the editor's list is an
+    // asset-registry query over sequences whose AnimSource points at it. So "removing an entry
+    // from the source" means clearing that pointer on the sequence itself.
+    //
+    // The assets are deliberately left on disk. A sequence that drifted into the wrong source
+    // usually still holds real artwork, and deleting it because it looked out of place would
+    // destroy content that is merely mis-filed.
+    //
+    // Returns JSON: { protocolName, protocolVersion, detachedCount, items: [ { objectPath,
+    // detached, assetClass, previousSource, error } ] }
+    UFUNCTION(BlueprintCallable, Category = "ZDBridge|PaperZD", CallInEditor)
+    static FString DetachSequencesFromAnimationSource(const TArray<FString>& SequenceObjectPaths);
 };

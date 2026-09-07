@@ -23,6 +23,7 @@
 #include "MetasoundFrontendDocumentBuilder.h"
 #include "ObjectTools.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/SavePackage.h"
 #include "AssetRegistry/IAssetRegistry.h"
 
 
@@ -539,6 +540,82 @@ FString UZDBridgeLibrary::PurgeAssets(const TArray<FString>& ObjectPaths)
 
     Root->SetNumberField(TEXT("deletedCount"), DeletedCount);
     Root->SetNumberField(TEXT("requestedCount"), Targets.Num());
+    Root->SetArrayField(TEXT("items"), Items);
+
+    FString Output;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+    FJsonSerializer::Serialize(Root, Writer);
+    return Output;
+}
+
+
+FString UZDBridgeLibrary::DetachSequencesFromAnimationSource(const TArray<FString>& SequenceObjectPaths)
+{
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("protocolName"), TEXT("ZDBridge.DetachSequences"));
+    Root->SetNumberField(TEXT("protocolVersion"), 1);
+
+    int32 DetachedCount = 0;
+    TArray<TSharedPtr<FJsonValue>> Items;
+    for (const FString& ObjectPath : SequenceObjectPaths)
+    {
+        if (ObjectPath.IsEmpty())
+        {
+            continue;
+        }
+
+        TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
+        Item->SetStringField(TEXT("objectPath"), ObjectPath);
+
+        UObject* Object = LoadObject<UObject>(nullptr, *ObjectPath);
+        UPaperZDAnimSequence* Sequence = Cast<UPaperZDAnimSequence>(Object);
+        Item->SetStringField(TEXT("assetClass"), Object ? Object->GetClass()->GetName() : FString());
+        if (!Sequence)
+        {
+            Item->SetBoolField(TEXT("detached"), false);
+            Item->SetStringField(TEXT("previousSource"), FString());
+            Item->SetStringField(TEXT("error"),
+                Object ? TEXT("object is not a PaperZD sequence") : TEXT("sequence could not be loaded"));
+            Items.Add(MakeShared<FJsonValueObject>(Item));
+            continue;
+        }
+
+        const UPaperZDAnimationSource* PreviousSource = Sequence->GetAnimSource();
+        Item->SetStringField(TEXT("previousSource"), PreviousSource ? PreviousSource->GetPathName() : FString());
+        if (!PreviousSource)
+        {
+            // 已经不挂在任何源上了，视为已完成。
+            Item->SetBoolField(TEXT("detached"), true);
+            Item->SetStringField(TEXT("error"), FString());
+            ++DetachedCount;
+            Items.Add(MakeShared<FJsonValueObject>(Item));
+            continue;
+        }
+
+        Sequence->Modify();
+        Sequence->SetAnimSource(nullptr);
+
+        // 不信调用本身，只认结果：指针真的空了才算解绑成功。
+        const bool bDetached = Sequence->GetAnimSource() == nullptr;
+        if (bDetached)
+        {
+            Sequence->MarkPackageDirty();
+            const FString FileName = FPackageName::LongPackageNameToFilename(
+                Sequence->GetOutermost()->GetName(), FPackageName::GetAssetPackageExtension());
+            FSavePackageArgs SaveArgs;
+            SaveArgs.TopLevelFlags = RF_Standalone;
+            SaveArgs.SaveFlags = SAVE_NoError;
+            UPackage::SavePackage(Sequence->GetOutermost(), nullptr, *FileName, SaveArgs);
+            ++DetachedCount;
+        }
+
+        Item->SetBoolField(TEXT("detached"), bDetached);
+        Item->SetStringField(TEXT("error"), bDetached ? FString() : TEXT("AnimSource pointer could not be cleared"));
+        Items.Add(MakeShared<FJsonValueObject>(Item));
+    }
+
+    Root->SetNumberField(TEXT("detachedCount"), DetachedCount);
+    Root->SetNumberField(TEXT("requestedCount"), Items.Num());
     Root->SetArrayField(TEXT("items"), Items);
 
     FString Output;
