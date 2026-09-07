@@ -16,6 +16,14 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "Editor.h"
+#include "MetasoundBuilderBase.h"
+#include "MetasoundDocumentInterface.h"
+#include "MetasoundEditorSubsystem.h"
+#include "MetasoundFrontendDocumentBuilder.h"
+#include "ObjectTools.h"
+#include "UObject/UObjectGlobals.h"
+#include "AssetRegistry/IAssetRegistry.h"
 
 
 namespace
@@ -192,6 +200,44 @@ bool UZDBridgeLibrary::AddOrUpdateSupportedAnimation(UObject* AnimationSource, F
     return true;
 }
 
+
+FString UZDBridgeLibrary::SetMetaSoundGraphVariableDefault(UObject* MetaSound, FName VariableName, const FMetasoundFrontendLiteral& DefaultLiteral)
+{
+    if (!MetaSound)
+    {
+        return TEXT("error: MetaSound is null");
+    }
+
+    TScriptInterface<IMetaSoundDocumentInterface> DocumentInterface(MetaSound);
+    if (!DocumentInterface)
+    {
+        return FString::Printf(TEXT("error: object is not a MetaSound document: %s"), *MetaSound->GetClass()->GetName());
+    }
+
+    UMetaSoundEditorSubsystem* EditorSubsystem = GEditor ? GEditor->GetEditorSubsystem<UMetaSoundEditorSubsystem>() : nullptr;
+    if (!EditorSubsystem)
+    {
+        return TEXT("error: MetaSound editor subsystem is unavailable");
+    }
+
+    EMetaSoundBuilderResult BuilderResult = EMetaSoundBuilderResult::Failed;
+    UMetaSoundBuilderBase* Builder = EditorSubsystem->FindOrBeginBuilding(DocumentInterface, BuilderResult);
+    if (!Builder || BuilderResult != EMetaSoundBuilderResult::Succeeded)
+    {
+        return FString::Printf(TEXT("error: no document builder for %s"), *MetaSound->GetPathName());
+    }
+
+    MetaSound->Modify();
+    if (!Builder->GetBuilder().SetGraphVariableDefault(VariableName, DefaultLiteral))
+    {
+        return FString::Printf(TEXT("error: graph variable is missing or not writable: %s"), *VariableName.ToString());
+    }
+
+    MetaSound->MarkPackageDirty();
+    UE_LOG(LogTemp, Log, TEXT("ZDBridge SetMetaSoundGraphVariableDefault: %s.%s"), *MetaSound->GetPathName(), *VariableName.ToString());
+    return FString();
+}
+
 FString UZDBridgeLibrary::ScanAnimationSource(UObject* AnimationSource)
 {
     TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
@@ -296,4 +342,207 @@ FString UZDBridgeLibrary::EnsureSequenceAnimationSource(UObject* AnimationSource
         return TEXT("created");
     }
     return TEXT("existing");
+}
+
+
+namespace
+{
+    /// 引用方先删、被引用方后删：序列 -> Flipbook -> Sprite -> 贴图。
+    /// 反过来删，Unreal 会因为还有人引用而拒绝，留下一地孤儿。
+    int32 PurgeRankOf(const UObject* Object)
+    {
+        if (!Object)
+        {
+            return 5;
+        }
+        const FString ClassName = Object->GetClass()->GetName();
+        if (ClassName.Contains(TEXT("PaperZDAnimSequence"))) return 0;
+        if (ClassName.Contains(TEXT("PaperFlipbook")))       return 1;
+        if (ClassName.Contains(TEXT("PaperSprite")))         return 2;
+        if (ClassName.Contains(TEXT("Texture")))             return 3;
+        return 4;
+    }
+
+    FName PurgePackageNameOf(const FString& ObjectPath)
+    {
+        return FName(*FPackageName::ObjectPathToPackageName(ObjectPath));
+    }
+
+    bool PurgeAssetIsGone(const FString& ObjectPath)
+    {
+        // 只认事实：内存里没有、盘上也没有，才算删掉了。
+        return FindObject<UObject>(nullptr, *ObjectPath) == nullptr &&
+               !FPackageName::DoesPackageExist(FPackageName::ObjectPathToPackageName(ObjectPath));
+    }
+
+    void PurgeCollectReferencers(
+        IAssetRegistry& AssetRegistry,
+        FName PackageName,
+        TArray<FName>& OutHard,
+        TArray<FName>& OutSoft)
+    {
+        using namespace UE::AssetRegistry;
+        AssetRegistry.GetReferencers(PackageName, OutHard, EDependencyCategory::Package, EDependencyQuery::Hard);
+        AssetRegistry.GetReferencers(PackageName, OutSoft, EDependencyCategory::Package, EDependencyQuery::Soft);
+        OutHard.Remove(PackageName);
+        OutSoft.Remove(PackageName);
+    }
+}
+
+FString UZDBridgeLibrary::PurgeAssets(const TArray<FString>& ObjectPaths)
+{
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("protocolName"), TEXT("ZDBridge.PurgeAssets"));
+    Root->SetNumberField(TEXT("protocolVersion"), 1);
+
+    IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+
+    struct FPurgeTarget
+    {
+        FString ObjectPath;
+        UObject* Object = nullptr;
+        FString AssetClass;
+        int32 Rank = 5;
+        bool bDeleted = false;
+        FString Action;
+        FString Error;
+        TArray<FName> Hard;
+        TArray<FName> Soft;
+    };
+
+    TArray<FPurgeTarget> Targets;
+    for (const FString& ObjectPath : ObjectPaths)
+    {
+        if (ObjectPath.IsEmpty())
+        {
+            continue;
+        }
+
+        FPurgeTarget Target;
+        Target.ObjectPath = ObjectPath;
+        if (PurgeAssetIsGone(ObjectPath))
+        {
+            Target.bDeleted = true;
+            Target.Action = TEXT("already-absent");
+            Targets.Add(MoveTemp(Target));
+            continue;
+        }
+
+        Target.Object = LoadObject<UObject>(nullptr, *ObjectPath);
+        Target.AssetClass = Target.Object ? Target.Object->GetClass()->GetName() : FString();
+        Target.Rank = PurgeRankOf(Target.Object);
+        PurgeCollectReferencers(AssetRegistry, PurgePackageNameOf(ObjectPath), Target.Hard, Target.Soft);
+        Targets.Add(MoveTemp(Target));
+    }
+
+    // 引用方排在被引用方前面。
+    Targets.Sort([](const FPurgeTarget& A, const FPurgeTarget& B)
+    {
+        return A.Rank != B.Rank ? A.Rank < B.Rank : A.ObjectPath < B.ObjectPath;
+    });
+
+    // ForceDeleteObjects 一遍删不干净。实测：8 个一批只删掉 7 个，
+    // 剩下那个单独重试一次就成功了 —— 尤其是源贴图已经不在的孤儿 Sprite。
+    // 所以多跑几遍，直到某一遍不再有进展为止。
+    auto CountRemaining = [&Targets]()
+    {
+        int32 Remaining = 0;
+        for (const FPurgeTarget& Target : Targets)
+        {
+            if (!Target.bDeleted && !PurgeAssetIsGone(Target.ObjectPath))
+            {
+                ++Remaining;
+            }
+        }
+        return Remaining;
+    };
+
+    const int32 MaxPasses = 3;
+    for (int32 Pass = 0; Pass < MaxPasses; ++Pass)
+    {
+        TArray<UObject*> Pending;
+        for (const FPurgeTarget& Target : Targets)
+        {
+            if (Target.bDeleted || PurgeAssetIsGone(Target.ObjectPath))
+            {
+                continue;
+            }
+
+            // 每遍都重新解析：上一遍可能已经把对象销毁了，缓存的指针不能再碰。
+            if (UObject* Object = LoadObject<UObject>(nullptr, *Target.ObjectPath))
+            {
+                Pending.AddUnique(Object);
+            }
+        }
+
+        if (Pending.Num() == 0)
+        {
+            break;
+        }
+
+        const int32 BeforePass = CountRemaining();
+        // 硬引用交给 ForceDeleteObjects 置空；bShowConfirmation=false 保持无人值守。
+        ObjectTools::ForceDeleteObjects(Pending, false);
+        CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+
+        if (CountRemaining() >= BeforePass)
+        {
+            // 这一遍毫无进展，再试也是白费。
+            break;
+        }
+    }
+
+    int32 DeletedCount = 0;
+    TArray<TSharedPtr<FJsonValue>> Items;
+    for (FPurgeTarget& Target : Targets)
+    {
+        if (!Target.bDeleted)
+        {
+            // 不信任何返回值，只复核资产是不是真的没了。
+            Target.bDeleted = PurgeAssetIsGone(Target.ObjectPath);
+            Target.Action = Target.bDeleted ? TEXT("force-deleted") : TEXT("failed");
+            if (!Target.bDeleted)
+            {
+                Target.Hard.Reset();
+                Target.Soft.Reset();
+                PurgeCollectReferencers(AssetRegistry, PurgePackageNameOf(Target.ObjectPath), Target.Hard, Target.Soft);
+                Target.Error = TEXT("still present after force delete");
+            }
+        }
+
+        if (Target.bDeleted)
+        {
+            ++DeletedCount;
+        }
+
+        TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
+        Item->SetStringField(TEXT("objectPath"), Target.ObjectPath);
+        Item->SetBoolField(TEXT("deleted"), Target.bDeleted);
+        Item->SetStringField(TEXT("assetClass"), Target.AssetClass);
+        Item->SetStringField(TEXT("action"), Target.Action);
+        Item->SetStringField(TEXT("error"), Target.Error);
+
+        TArray<TSharedPtr<FJsonValue>> HardValues;
+        for (const FName& Name : Target.Hard)
+        {
+            HardValues.Add(MakeShared<FJsonValueString>(Name.ToString()));
+        }
+        TArray<TSharedPtr<FJsonValue>> SoftValues;
+        for (const FName& Name : Target.Soft)
+        {
+            SoftValues.Add(MakeShared<FJsonValueString>(Name.ToString()));
+        }
+        Item->SetArrayField(TEXT("hardReferencers"), HardValues);
+        Item->SetArrayField(TEXT("softReferencers"), SoftValues);
+        Items.Add(MakeShared<FJsonValueObject>(Item));
+    }
+
+    Root->SetNumberField(TEXT("deletedCount"), DeletedCount);
+    Root->SetNumberField(TEXT("requestedCount"), Targets.Num());
+    Root->SetArrayField(TEXT("items"), Items);
+
+    FString Output;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+    FJsonSerializer::Serialize(Root, Writer);
+    return Output;
 }
