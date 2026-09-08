@@ -25,6 +25,10 @@
 #include "UObject/UObjectGlobals.h"
 #include "UObject/SavePackage.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "Engine/DataTable.h"
+#include "JsonObjectConverter.h"
+#include "Internationalization/Text.h"
+#include "Internationalization/TextPackageNamespaceUtil.h"
 
 
 namespace
@@ -622,4 +626,461 @@ FString UZDBridgeLibrary::DetachSequencesFromAnimationSource(const TArray<FStrin
     TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
     FJsonSerializer::Serialize(Root, Writer);
     return Output;
+}
+
+
+namespace
+{
+    /**
+     * 用给定的命名空间和键重建一段 FText。
+     *
+     * 走的是 NSLOCTEXT 宏底下那条路：这样写回资产时序列化成
+     * NSLOCTEXT("ns", "key", "文本")，和美术在编辑器里填的没有区别。
+     * 直接 FText::FromString 出来的是文化无关文本，会把本地化条目降级。
+     */
+    FText MakeKeyedText(const FString& Namespace, const FString& Key, const FString& Source)
+    {
+        if (Namespace.IsEmpty() || Key.IsEmpty())
+        {
+            return FText::FromString(Source);
+        }
+        return FText::AsLocalizable_Advanced(FTextKey(*Namespace), FTextKey(*Key), Source);
+    }
+
+    /** 取一段 FText 现有的命名空间和键；没有就返回空串。 */
+    void InspectText(const FText& Text, FString& OutNamespace, FString& OutKey)
+    {
+        OutNamespace.Reset();
+        OutKey.Reset();
+        if (TOptional<FString> Namespace = FTextInspector::GetNamespace(Text))
+        {
+            OutNamespace = TextNamespaceUtil::StripPackageNamespace(*Namespace);
+        }
+        if (TOptional<FString> Key = FTextInspector::GetKey(Text))
+        {
+            OutKey = *Key;
+        }
+    }
+
+    /**
+     * 把一个 JSON 值写进 FText 属性，尽量沿用原位置的命名空间和键。
+     *
+     * 键沿用的意义：同一句技能介绍改了错别字，本地化条目还是同一条，
+     * 不会每同步一次就多出一条孤儿条目。原来没有键时才新生成。
+     */
+    void ApplyTextValue(const TSharedPtr<FJsonValue>& Value, FText& Target, const FString& FallbackNamespace)
+    {
+        FString Namespace;
+        FString Key;
+        InspectText(Target, Namespace, Key);
+        if (Namespace.IsEmpty())
+        {
+            Namespace = FallbackNamespace;
+        }
+        if (Key.IsEmpty())
+        {
+            Key = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+        }
+        Target = MakeKeyedText(Namespace, Key, Value.IsValid() ? Value->AsString() : FString());
+    }
+
+    /** FText 数组：逐下标沿用原有的键，多出来的新元素各自生成新键。 */
+    bool ApplyTextArrayProperty(
+        const FArrayProperty& ArrayProperty,
+        const FTextProperty& InnerProperty,
+        void* ValuePtr,
+        const TArray<TSharedPtr<FJsonValue>>& JsonValues,
+        const FString& FallbackNamespace)
+    {
+        FScriptArrayHelper Helper(&ArrayProperty, ValuePtr);
+        TArray<FText> Existing;
+        Existing.Reserve(Helper.Num());
+        for (int32 Index = 0; Index < Helper.Num(); ++Index)
+        {
+            Existing.Add(*InnerProperty.GetPropertyValuePtr(Helper.GetRawPtr(Index)));
+        }
+
+        Helper.Resize(JsonValues.Num());
+        for (int32 Index = 0; Index < JsonValues.Num(); ++Index)
+        {
+            FText* Slot = InnerProperty.GetPropertyValuePtr(Helper.GetRawPtr(Index));
+            if (Existing.IsValidIndex(Index))
+            {
+                *Slot = Existing[Index];
+            }
+            ApplyTextValue(JsonValues[Index], *Slot, FallbackNamespace);
+        }
+        return true;
+    }
+
+    /** 把 JSON 里的一个字段写进行结构体的对应属性。 */
+    bool ApplyStructField(
+        const UScriptStruct& Struct,
+        uint8* StructData,
+        const FString& FieldName,
+        const TSharedPtr<FJsonValue>& JsonValue,
+        const FString& FallbackNamespace,
+        FString& OutError);
+
+    /** 把一个 JSON 对象逐字段覆盖到结构体上；没出现的字段保持原样。 */
+    bool ApplyJsonObjectToStruct(
+        const UScriptStruct& Struct,
+        uint8* StructData,
+        const FJsonObject& Fields,
+        const FString& FallbackNamespace,
+        FString& OutError)
+    {
+        for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Fields.Values)
+        {
+            if (!ApplyStructField(Struct, StructData, Pair.Key, Pair.Value, FallbackNamespace, OutError))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 把结构体上某个字段的现值读成 JSON，写完之后自查用。 */
+    TSharedPtr<FJsonValue> ReadStructField(const UScriptStruct& Struct, const uint8* StructData, const FString& FieldName)
+    {
+        FProperty* Property = Struct.FindPropertyByName(FName(*FieldName));
+        if (!Property)
+        {
+            return MakeShared<FJsonValueString>(TEXT("<no such property>"));
+        }
+        const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(StructData);
+        TSharedPtr<FJsonValue> Value = FJsonObjectConverter::UPropertyToJsonValue(Property, ValuePtr, 0, 0);
+        return Value.IsValid() ? Value : MakeShared<FJsonValueString>(TEXT("<unreadable>"));
+    }
+
+    /**
+     * 按键合并一个映射属性，而不是整体替换。
+     *
+     * 连携技就是这么存的：12SkInfor 每行有一个 SubCharName 映射，键是搭档名字。
+     * 同步某一个搭档时如果整个映射被替换掉，同角色其余搭档的连携技会一起没掉。
+     * 只有 JSON 里出现的键会被改，值是结构体时继续按字段递归覆盖。
+     */
+    bool ApplyStringKeyedMapMerge(
+        const FMapProperty& MapProperty,
+        void* ValuePtr,
+        const FJsonObject& Entries,
+        const FString& FallbackNamespace,
+        FString& OutError)
+    {
+        FStrProperty* KeyProperty = CastField<FStrProperty>(MapProperty.KeyProp);
+        FStructProperty* ValueProperty = CastField<FStructProperty>(MapProperty.ValueProp);
+        if (!KeyProperty || !ValueProperty || !ValueProperty->Struct)
+        {
+            return false;
+        }
+
+        FScriptMapHelper Helper(&MapProperty, ValuePtr);
+        for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : Entries.Values)
+        {
+            const TSharedPtr<FJsonObject>* EntryFields = nullptr;
+            if (!Entry.Value.IsValid() || !Entry.Value->TryGetObject(EntryFields) || !EntryFields->IsValid())
+            {
+                OutError = FString::Printf(TEXT("map entry %s expects a JSON object"), *Entry.Key);
+                return false;
+            }
+
+            // 已有的键就地改，没有的才新增，这样原有内容不会被重建。
+            int32 Index = INDEX_NONE;
+            for (FScriptMapHelper::FIterator It(Helper); It; ++It)
+            {
+                if (*KeyProperty->GetPropertyValuePtr(Helper.GetKeyPtr(It.GetInternalIndex())) == Entry.Key)
+                {
+                    Index = It.GetInternalIndex();
+                    break;
+                }
+            }
+            if (Index == INDEX_NONE)
+            {
+                Index = Helper.AddDefaultValue_Invalid_NeedsRehash();
+                KeyProperty->SetPropertyValue(Helper.GetKeyPtr(Index), Entry.Key);
+                Helper.Rehash();
+                // Rehash 会搬动元素，重新定位一次。
+                for (FScriptMapHelper::FIterator It(Helper); It; ++It)
+                {
+                    if (*KeyProperty->GetPropertyValuePtr(Helper.GetKeyPtr(It.GetInternalIndex())) == Entry.Key)
+                    {
+                        Index = It.GetInternalIndex();
+                        break;
+                    }
+                }
+            }
+
+            if (!ApplyJsonObjectToStruct(
+                    *ValueProperty->Struct,
+                    Helper.GetValuePtr(Index),
+                    **EntryFields,
+                    FallbackNamespace,
+                    OutError))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 把 JSON 里的一个字段写进结构体的对应属性。 */
+    bool ApplyStructField(
+        const UScriptStruct& Struct,
+        uint8* StructData,
+        const FString& FieldName,
+        const TSharedPtr<FJsonValue>& JsonValue,
+        const FString& FallbackNamespace,
+        FString& OutError)
+    {
+        FProperty* Property = Struct.FindPropertyByName(FName(*FieldName));
+        if (!Property)
+        {
+            OutError = FString::Printf(TEXT("struct has no property named %s"), *FieldName);
+            return false;
+        }
+
+        void* ValuePtr = Property->ContainerPtrToValuePtr<void>(StructData);
+
+        // FText 单独处理：JsonObjectConverter 会把它降级成文化无关文本。
+        if (FTextProperty* TextProperty = CastField<FTextProperty>(Property))
+        {
+            FText* Target = TextProperty->GetPropertyValuePtr(ValuePtr);
+            ApplyTextValue(JsonValue, *Target, FallbackNamespace);
+            return true;
+        }
+        if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
+        {
+            if (FTextProperty* InnerText = CastField<FTextProperty>(ArrayProperty->Inner))
+            {
+                const TArray<TSharedPtr<FJsonValue>>* JsonArray = nullptr;
+                if (!JsonValue.IsValid() || !JsonValue->TryGetArray(JsonArray))
+                {
+                    OutError = FString::Printf(TEXT("%s expects a JSON array"), *FieldName);
+                    return false;
+                }
+                return ApplyTextArrayProperty(*ArrayProperty, *InnerText, ValuePtr, *JsonArray, FallbackNamespace);
+            }
+        }
+        // 嵌套结构体：继续逐字段覆盖，否则整块替换会把没提到的字段清成默认值，
+        // 里面的 FText 本地化键也会一起丢掉。
+        if (FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+        {
+            const TSharedPtr<FJsonObject>* Fields = nullptr;
+            if (StructProperty->Struct && JsonValue.IsValid() && JsonValue->TryGetObject(Fields) && Fields->IsValid())
+            {
+                return ApplyJsonObjectToStruct(
+                    *StructProperty->Struct, reinterpret_cast<uint8*>(ValuePtr), **Fields, FallbackNamespace, OutError);
+            }
+        }
+        if (FMapProperty* MapProperty = CastField<FMapProperty>(Property))
+        {
+            const TSharedPtr<FJsonObject>* Entries = nullptr;
+            if (JsonValue.IsValid() && JsonValue->TryGetObject(Entries) && Entries->IsValid() &&
+                ApplyStringKeyedMapMerge(*MapProperty, ValuePtr, **Entries, FallbackNamespace, OutError))
+            {
+                return true;
+            }
+            if (!OutError.IsEmpty())
+            {
+                return false;
+            }
+            // 不是「字符串键 -> 结构体」的映射就退回整体转换（等级倍率那种就走这条）。
+        }
+
+        if (!FJsonObjectConverter::JsonValueToUProperty(JsonValue, Property, ValuePtr, 0, 0))
+        {
+            OutError = FString::Printf(TEXT("failed to convert JSON value for %s"), *FieldName);
+            return false;
+        }
+        return true;
+    }
+}
+
+FString UZDBridgeLibrary::UpsertDataTableRow(const FString& TableObjectPath, FName RowName, const FString& RowJson)
+{
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("tableObjectPath"), TableObjectPath);
+    Root->SetStringField(TEXT("rowName"), RowName.ToString());
+    Root->SetBoolField(TEXT("ok"), false);
+    Root->SetBoolField(TEXT("created"), false);
+    TArray<TSharedPtr<FJsonValue>> WrittenFields;
+
+    const auto Finish = [&Root, &WrittenFields](const FString& Error) -> FString
+    {
+        Root->SetArrayField(TEXT("writtenFields"), WrittenFields);
+        Root->SetStringField(TEXT("error"), Error);
+        Root->SetBoolField(TEXT("ok"), Error.IsEmpty());
+        FString Output;
+        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+        FJsonSerializer::Serialize(Root, Writer);
+        return Output;
+    };
+
+    UDataTable* Table = LoadObject<UDataTable>(nullptr, *TableObjectPath);
+    if (!Table)
+    {
+        return Finish(TEXT("data table could not be loaded"));
+    }
+    const UScriptStruct* RowStruct = Table->GetRowStruct();
+    if (!RowStruct)
+    {
+        return Finish(TEXT("data table has no row struct"));
+    }
+    if (RowName.IsNone())
+    {
+        return Finish(TEXT("row name is empty"));
+    }
+
+    TSharedPtr<FJsonObject> Fields;
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RowJson);
+    if (!FJsonSerializer::Deserialize(Reader, Fields) || !Fields.IsValid())
+    {
+        return Finish(TEXT("row JSON could not be parsed"));
+    }
+
+    // 先复制一份现有行，再往上覆盖：没出现在 JSON 里的字段必须原样保留，
+    // 否则勾选一个字段就会把同一行其余手工填的内容清空。
+    uint8* Existing = Table->FindRowUnchecked(RowName);
+    Root->SetBoolField(TEXT("created"), Existing == nullptr);
+
+    TArray<uint8> Buffer;
+    Buffer.SetNumZeroed(RowStruct->GetStructureSize());
+    RowStruct->InitializeStruct(Buffer.GetData());
+    if (Existing)
+    {
+        RowStruct->CopyScriptStruct(Buffer.GetData(), Existing);
+    }
+
+    const FString FallbackNamespace = FPackageName::GetShortName(Table->GetOutermost()->GetName());
+    FString Error;
+    if (!ApplyJsonObjectToStruct(*RowStruct, Buffer.GetData(), *Fields, FallbackNamespace, Error))
+    {
+        RowStruct->DestroyStruct(Buffer.GetData());
+        return Finish(Error);
+    }
+    TSharedRef<FJsonObject> ReadBack = MakeShared<FJsonObject>();
+    for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Fields->Values)
+    {
+        WrittenFields.Add(MakeShared<FJsonValueString>(Pair.Key));
+        ReadBack->SetField(Pair.Key, ReadStructField(*RowStruct, Buffer.GetData(), Pair.Key));
+    }
+    Root->SetObjectField(TEXT("readBack"), ReadBack);
+
+    Table->Modify();
+    Table->AddRow(RowName, Buffer.GetData(), RowStruct);
+    RowStruct->DestroyStruct(Buffer.GetData());
+
+    Table->MarkPackageDirty();
+    const FString FileName = FPackageName::LongPackageNameToFilename(
+        Table->GetOutermost()->GetName(), FPackageName::GetAssetPackageExtension());
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Standalone;
+    SaveArgs.SaveFlags = SAVE_NoError;
+    if (!UPackage::SavePackage(Table->GetOutermost(), nullptr, *FileName, SaveArgs))
+    {
+        return Finish(TEXT("data table package could not be saved"));
+    }
+
+    return Finish(FString());
+}
+
+FString UZDBridgeLibrary::ApplyJsonToStructProperty(UObject* Owner, FName StructPropertyName, const FString& Json)
+{
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("structProperty"), StructPropertyName.ToString());
+    TArray<TSharedPtr<FJsonValue>> WrittenFields;
+
+    const auto Finish = [&Root, &WrittenFields](const FString& Error) -> FString
+    {
+        Root->SetArrayField(TEXT("writtenFields"), WrittenFields);
+        Root->SetStringField(TEXT("error"), Error);
+        Root->SetBoolField(TEXT("ok"), Error.IsEmpty());
+        FString Output;
+        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+        FJsonSerializer::Serialize(Root, Writer);
+        return Output;
+    };
+
+    if (!Owner)
+    {
+        return Finish(TEXT("owner object is null"));
+    }
+
+    FStructProperty* StructProperty = CastField<FStructProperty>(
+        Owner->GetClass()->FindPropertyByName(StructPropertyName));
+    if (!StructProperty || !StructProperty->Struct)
+    {
+        return Finish(TEXT("owner has no struct property with that name"));
+    }
+
+    TSharedPtr<FJsonObject> Fields;
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+    if (!FJsonSerializer::Deserialize(Reader, Fields) || !Fields.IsValid())
+    {
+        return Finish(TEXT("JSON could not be parsed"));
+    }
+
+    // 直接改 CDO 上那份结构体内存：没出现在 JSON 里的字段原样保留。
+    uint8* StructData = StructProperty->ContainerPtrToValuePtr<uint8>(Owner);
+    const FString FallbackNamespace = FPackageName::GetShortName(Owner->GetOutermost()->GetName());
+
+    Owner->Modify();
+    FString Error;
+    if (!ApplyJsonObjectToStruct(*StructProperty->Struct, StructData, *Fields, FallbackNamespace, Error))
+    {
+        return Finish(Error);
+    }
+    for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Fields->Values)
+    {
+        WrittenFields.Add(MakeShared<FJsonValueString>(Pair.Key));
+    }
+
+    Owner->MarkPackageDirty();
+    return Finish(FString());
+}
+
+FString UZDBridgeLibrary::ReadDataTableRow(const FString& TableObjectPath, FName RowName)
+{
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("tableObjectPath"), TableObjectPath);
+    Root->SetStringField(TEXT("rowName"), RowName.ToString());
+    Root->SetBoolField(TEXT("found"), false);
+
+    const auto Finish = [&Root](const FString& Error) -> FString
+    {
+        Root->SetStringField(TEXT("error"), Error);
+        Root->SetBoolField(TEXT("ok"), Error.IsEmpty());
+        FString Output;
+        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+        FJsonSerializer::Serialize(Root, Writer);
+        return Output;
+    };
+
+    UDataTable* Table = LoadObject<UDataTable>(nullptr, *TableObjectPath);
+    if (!Table)
+    {
+        return Finish(TEXT("data table could not be loaded"));
+    }
+    const UScriptStruct* RowStruct = Table->GetRowStruct();
+    if (!RowStruct)
+    {
+        return Finish(TEXT("data table has no row struct"));
+    }
+
+    const uint8* RowData = Table->FindRowUnchecked(RowName);
+    if (!RowData)
+    {
+        // 行不存在不是错误：界面要据此显示成「待新增」。
+        return Finish(FString());
+    }
+
+    TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+    if (!FJsonObjectConverter::UStructToJsonObject(RowStruct, RowData, Row, 0, 0))
+    {
+        return Finish(TEXT("row could not be converted to JSON"));
+    }
+
+    Root->SetBoolField(TEXT("found"), true);
+    Root->SetObjectField(TEXT("row"), Row);
+    return Finish(FString());
 }

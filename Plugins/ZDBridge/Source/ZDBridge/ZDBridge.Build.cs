@@ -23,6 +23,7 @@ public class ZDBridge : ModuleRules
             "PaperZDEditor",
             "AssetRegistry",
             "Json",
+            "JsonUtilities",
             "MetasoundEngine",
             "MetasoundEditor"
         });
