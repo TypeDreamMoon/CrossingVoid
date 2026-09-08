@@ -11,7 +11,9 @@ public class ZDBridge : ModuleRules
             "CoreUObject",
             "Engine",
             "Paper2D",
-            "PaperZD"
+            "PaperZD",
+            // 公共头里用到 FMetasoundFrontendLiteral，必须是 Public 依赖。
+            "MetasoundFrontend"
         });
         PrivateDependencyModuleNames.AddRange(new[]
         {
@@ -20,7 +22,10 @@ public class ZDBridge : ModuleRules
             "Paper2DEditor",
             "PaperZDEditor",
             "AssetRegistry",
-            "Json"
+            "Json",
+            "JsonUtilities",
+            "MetasoundEngine",
+            "MetasoundEditor"
         });
     }
 }

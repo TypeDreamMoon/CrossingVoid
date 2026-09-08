@@ -15,6 +15,7 @@
   ],
   "Plugins": [
     { "Name": "Paper2D", "Enabled": true },
-    { "Name": "PaperZD", "Enabled": true }
+    { "Name": "PaperZD", "Enabled": true },
+    { "Name": "Metasound", "Enabled": true }
   ]
 }
